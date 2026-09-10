@@ -1,0 +1,637 @@
+/* ============================================================================
+   SNAKE en RTM32 Assembly
+   ============================================================================
+
+   HARDWARE DE E/S (CONFIRMADO):
+
+   El manual de arquitectura (rtm32.pdf) documenta que hay un dispositivo
+   serial (UART) mapeado en memoria (MMIO) en el rango de Kernel Space, y que
+   la direccion -0x100 (0xFFFFFF00) es su registro de datos (confirmado
+   ademas por hola_mundo.rtm/criba.rtm, que escriben ahi para imprimir).
+
+   La seccion de Entrada/Salida del manual todavia no esta redactada ("PRONTO
+   ..."), pero el binario del emulador provisto (rtm32, ELF sin stripear, con
+   simbolos de depuracion) permitio desensamblar el driver del dispositivo
+   serial (serial_mmio_read/serial_mmio_write en src/serial.c) y confirmar el
+   mapa de registros exacto, de a 1 byte cada uno (accesos que no sean de 1
+   byte son ignorados por el dispositivo):
+
+     Base = -0x100 (0xFFFFFF00)
+       +0x0  DATA    escritura = transmite (imprime) el byte por consola.
+                      lectura   = extrae un byte de la FIFO de entrada
+                      (teclado/telnet). Si la FIFO esta vacia devuelve 0.
+       +0x4  STATUS  (solo lectura) bit0 = RX_READY (hay un byte listo para
+                      leer en DATA), bit1 = TX_READY, bit2 = OVERRUN.
+       +0x8  CONTROL (solo escritura) habilita interrupciones (IE_RX,
+                      IE_OVERRUN); no se usa aca porque este juego hace
+                      polling en vez de usar interrupciones.
+
+   Por eso `leer_tecla` primero consulta STATUS (+0x4) y solo lee DATA (+0x0)
+   si el bit RX_READY esta en 1, evitando lecturas invalidas cuando no hay
+   tecla pendiente.
+
+   No hay timer ni generador de numeros aleatorios documentado, por lo que:
+
+     - El delay entre frames es un busy-wait (loop contando iteraciones), no
+       tiempo real.
+     - La comida se ubica con un LCG (generador congruencial lineal) por
+       software, usando `mul` y `andi`/`restu`.
+
+   ============================================================================
+   CONTROLES: w = arriba, s = abajo, a = izquierda, d = derecha.
+   Tablero: 20 columnas x 10 filas, sin wraparound (choque con borde = fin).
+   ============================================================================ */
+
+.section ".data"
+	// ---- Tablero ----
+	BOARD_W: .word 20
+	BOARD_H: .word 10
+
+	// ---- Estado de la serpiente ----
+	// Buffer circular de 256 posiciones (potencia de 2 -> wrap con andi 0xFF)
+	snake_x: .pad 256
+	snake_y: .pad 256
+
+	head:    .word 2   // indice de la cabeza (ultimo segmento insertado)
+	tail:    .word 0   // indice de la cola (proximo a remover)
+	len:     .word 3   // longitud actual
+
+	dir:     .word 1   // 0=arriba 1=derecha 2=abajo 3=izquierda
+
+	// ---- Comida ----
+	food_x:  .word 10
+	food_y:  .word 5
+
+	// ---- RNG (LCG) ----
+	seed:    .word 12345
+
+	// ---- Puntaje ----
+	score:   .word 0
+
+	// ---- Mensajes ----
+	msg_gameover: .asciiz "GAME OVER"
+	msg_score:    .asciiz "Puntaje: "
+
+	// ---- Secuencias de dibujo ----
+	ansi_clear: .asciiz "\x1b[2J\x1b[H"
+
+.section ".text"
+	addi $sp, $zero, 0xFFC
+
+	// Inicializamos snake_x/snake_y con una serpiente horizontal de 3
+	// segmentos en el centro del tablero, mirando hacia la derecha.
+	// Segmentos (indices 0,1,2): cabeza en indice 2 = (10,5), luego (9,5), (8,5)
+	addi $t0, $zero, 8
+	addi $t1, $zero, 5
+	sb $t0, snake_x($zero)
+	sb $t1, snake_y($zero)
+
+	addi $t0, $zero, 9
+	addi $s0, $zero, 1
+	sb $t0, snake_x($s0)
+	sb $t1, snake_y($s0)
+
+	addi $t0, $zero, 10
+	addi $s0, $zero, 2
+	sb $t0, snake_x($s0)
+	sb $t1, snake_y($s0)
+
+	// Generamos la posicion inicial de la comida con el LCG (en vez de un
+	// valor fijo) para garantizar que no caiga sobre la serpiente recien
+	// inicializada.
+	jal generar_comida
+
+game_loop:
+	jal leer_tecla
+	// $a0 = tecla leida (0 si ninguna)
+	jal actualizar_direccion
+
+	jal mover_serpiente
+	// $a0 (retorno de mover_serpiente) = 1 si hubo colision (game over)
+	bne $a0, $zero, game_over
+
+	jal dibujar_tablero
+
+	jal delay
+
+	j game_loop
+
+game_over:
+	orh $a0, $zero, .hi16 ansi_clear
+	ori $a0, $a0,   .lo16 ansi_clear
+	jal imprimir_asciiz
+
+	orh $a0, $zero, .hi16 msg_gameover
+	ori $a0, $a0,   .lo16 msg_gameover
+	jal imprimir_asciiz
+
+	orh $a0, $zero, .hi16 msg_score
+	ori $a0, $a0,   .lo16 msg_score
+	jal imprimir_asciiz
+
+	lw $a0, score($zero)
+	jal print32u
+
+	trap 1
+
+// ============================================================================
+// leer_tecla: lee una tecla del dispositivo serial (ver mapa de registros
+// arriba). Primero consulta STATUS (+0x4, bit0 = RX_READY) y solo si hay un
+// byte pendiente lee DATA (+0x0), que lo extrae de la FIFO de entrada.
+// Retorna en $a0 el codigo ASCII de la tecla, o 0 si no hay ninguna pendiente.
+// ============================================================================
+leer_tecla:
+	addi $t0, $zero, -0x100  // direccion base del dispositivo serial
+
+	lbu $t1, 4($t0)          // STATUS
+	andi $t1, $t1, 1         // bit0 = RX_READY
+	beq $t1, $zero, leer_tecla'sin_tecla
+
+	lbu $a0, 0($t0)          // DATA: extrae el byte de la FIFO
+	jr $ra, 0
+
+leer_tecla'sin_tecla:
+	addi $a0, $zero, 0
+	jr $ra, 0
+
+// ============================================================================
+// actualizar_direccion: recibe en $a0 la tecla leida y actualiza `dir`,
+// ignorando giros de 180 grados instantaneos (por ejemplo ir de derecha a
+// izquierda de un solo golpe).
+// ============================================================================
+actualizar_direccion:
+	lw $t0, dir($zero)
+
+	addi $t1, $zero, 'w'
+	bne $a0, $t1, actualizar_direccion'no_arriba
+	addi $t2, $zero, 2
+	beq $t0, $t2, actualizar_direccion'salir  // veniamos de abajo -> ignorar
+	addi $t0, $zero, 0
+	j actualizar_direccion'guardar
+actualizar_direccion'no_arriba:
+
+	addi $t1, $zero, 's'
+	bne $a0, $t1, actualizar_direccion'no_abajo
+	addi $t2, $zero, 0
+	beq $t0, $t2, actualizar_direccion'salir  // veniamos de arriba -> ignorar
+	addi $t0, $zero, 2
+	j actualizar_direccion'guardar
+actualizar_direccion'no_abajo:
+
+	addi $t1, $zero, 'a'
+	bne $a0, $t1, actualizar_direccion'no_izq
+	addi $t2, $zero, 1
+	beq $t0, $t2, actualizar_direccion'salir  // veniamos de derecha -> ignorar
+	addi $t0, $zero, 3
+	j actualizar_direccion'guardar
+actualizar_direccion'no_izq:
+
+	addi $t1, $zero, 'd'
+	bne $a0, $t1, actualizar_direccion'salir
+	addi $t2, $zero, 3
+	beq $t0, $t2, actualizar_direccion'salir  // veniamos de izquierda -> ignorar
+	addi $t0, $zero, 1
+	j actualizar_direccion'guardar
+
+actualizar_direccion'guardar:
+	sw $t0, dir($zero)
+actualizar_direccion'salir:
+	jr $ra, 0
+
+// ============================================================================
+// mover_serpiente: calcula la nueva posicion de la cabeza segun `dir`,
+// chequea colisiones contra pared y contra el propio cuerpo, y si esta libre
+// la inserta. Si coincide con la comida, la serpiente crece (no se quita la
+// cola) y se genera nueva comida; si no, se quita la cola (se mueve).
+// Retorna en $a0: 1 si hubo colision (game over), 0 si no.
+// ============================================================================
+mover_serpiente:
+	addi $sp, $sp, -24
+	sw $s0, 0($sp)
+	sw $s1, 4($sp)
+	sw $s2, 8($sp)
+	sw $s3, 12($sp)
+	sw $s4, 16($sp)
+	sw $ra, 20($sp)
+
+	// $s0 = nueva x, $s1 = nueva y
+	lw $t0, head($zero)
+	lbu $s0, snake_x($t0)
+	lbu $s1, snake_y($t0)
+
+	lw $t1, dir($zero)
+
+	addi $t2, $zero, 0
+	bne $t1, $t2, mover_serpiente'chk1
+	addi $s1, $s1, -1
+	j mover_serpiente'movida
+mover_serpiente'chk1:
+	addi $t2, $zero, 1
+	bne $t1, $t2, mover_serpiente'chk2
+	addi $s0, $s0, 1
+	j mover_serpiente'movida
+mover_serpiente'chk2:
+	addi $t2, $zero, 2
+	bne $t1, $t2, mover_serpiente'chk3
+	addi $s1, $s1, 1
+	j mover_serpiente'movida
+mover_serpiente'chk3:
+	// direccion == 3 (izquierda)
+	addi $s0, $s0, -1
+mover_serpiente'movida:
+
+	// Chequeo de colision con pared: x < 0 || x >= BOARD_W || y < 0 || y >= BOARD_H
+	blt $s0, $zero, mover_serpiente'colision
+	lw $t3, BOARD_W($zero)
+	bge $s0, $t3, mover_serpiente'colision
+	blt $s1, $zero, mover_serpiente'colision
+	lw $t3, BOARD_H($zero)
+	bge $s1, $t3, mover_serpiente'colision
+
+	// Chequeo de colision contra el propio cuerpo: recorremos [tail, head]
+	lw $s2, tail($zero)   // indice actual de recorrido
+	lw $s3, len($zero)    // contador de segmentos restantes por chequear
+mover_serpiente'chk_cuerpo:
+	beq $s3, $zero, mover_serpiente'sin_colision_cuerpo
+	lbu $t0, snake_x($s2)
+	lbu $t1, snake_y($s2)
+	bne $t0, $s0, mover_serpiente'chk_cuerpo_next
+	bne $t1, $s1, mover_serpiente'chk_cuerpo_next
+	j mover_serpiente'colision
+mover_serpiente'chk_cuerpo_next:
+	addi $s2, $s2, 1
+	andi $s2, $s2, 0xFF
+	addi $s3, $s3, -1
+	j mover_serpiente'chk_cuerpo
+
+mover_serpiente'sin_colision_cuerpo:
+	// Insertamos la nueva cabeza
+	lw $s4, head($zero)
+	addi $s4, $s4, 1
+	andi $s4, $s4, 0xFF
+	sb $s0, snake_x($s4)
+	sb $s1, snake_y($s4)
+	sw $s4, head($zero)
+
+	// Chequeamos si comio
+	lw $t0, food_x($zero)
+	lw $t1, food_y($zero)
+	bne $s0, $t0, mover_serpiente'no_comio
+	bne $s1, $t1, mover_serpiente'no_comio
+
+	// Comio: crece (no se mueve la cola), incrementa longitud y puntaje,
+	// genera nueva comida.
+	lw $t2, len($zero)
+	addi $t2, $t2, 1
+	sw $t2, len($zero)
+
+	lw $t2, score($zero)
+	addi $t2, $t2, 1
+	sw $t2, score($zero)
+
+	jal generar_comida
+
+	j mover_serpiente'sin_game_over
+
+mover_serpiente'no_comio:
+	// No comio: avanza (quita la cola)
+	lw $t0, tail($zero)
+	addi $t0, $t0, 1
+	andi $t0, $t0, 0xFF
+	sw $t0, tail($zero)
+
+mover_serpiente'sin_game_over:
+	addi $a0, $zero, 0
+	j mover_serpiente'salir
+
+mover_serpiente'colision:
+	addi $a0, $zero, 1
+
+mover_serpiente'salir:
+	lw $s0, 0($sp)
+	lw $s1, 4($sp)
+	lw $s2, 8($sp)
+	lw $s3, 12($sp)
+	lw $s4, 16($sp)
+	lw $ra, 20($sp)
+	addi $sp, $sp, 24
+	jr $ra, 0
+
+// ============================================================================
+// generar_comida: usa un LCG para elegir una nueva posicion de comida dentro
+// del tablero, evitando que caiga sobre la serpiente (reintenta si es asi).
+// ============================================================================
+generar_comida:
+	addi $sp, $sp, -12
+	sw $s0, 0($sp)
+	sw $s1, 4($sp)
+	sw $ra, 8($sp)
+
+generar_comida'intentar:
+	// seed = seed * 1103515245 + 12345 (LCG clasico)
+	lw $t0, seed($zero)
+	orh $t1, $zero, .hi16 lcg_a
+	ori $t1, $t1,   .lo16 lcg_a
+	lw $t1, 0($t1)
+	mul $t0, $t0, $t1
+	addi $t0, $t0, 12345
+	sw $t0, seed($zero)
+
+	// x = (seed >> 8) % BOARD_W  (usamos parte alta para mas variacion)
+	srl $t2, $t0, 8
+	lw $t3, BOARD_W($zero)
+	restu $s0, $t2, $t3
+
+	// y = (seed >> 16) % BOARD_H
+	srl $t2, $t0, 16
+	lw $t3, BOARD_H($zero)
+	restu $s1, $t2, $t3
+
+	// Verificamos que no colisione con la serpiente
+	lw $t4, tail($zero)
+	lw $t5, len($zero)
+generar_comida'chk:
+	beq $t5, $zero, generar_comida'ok
+	lbu $t0, snake_x($t4)
+	lbu $t1, snake_y($t4)
+	bne $t0, $s0, generar_comida'chk_next
+	bne $t1, $s1, generar_comida'chk_next
+	j generar_comida'intentar
+generar_comida'chk_next:
+	addi $t4, $t4, 1
+	andi $t4, $t4, 0xFF
+	addi $t5, $t5, -1
+	j generar_comida'chk
+
+generar_comida'ok:
+	sw $s0, food_x($zero)
+	sw $s1, food_y($zero)
+
+	lw $s0, 0($sp)
+	lw $s1, 4($sp)
+	lw $ra, 8($sp)
+	addi $sp, $sp, 12
+	jr $ra, 0
+
+.section ".data"
+	lcg_a: .word 1103515245
+
+.section ".text"
+
+// ============================================================================
+// dibujar_tablero: limpia la pantalla (ANSI) y redibuja el tablero completo,
+// fila por fila, marcando cabeza ('O'), cuerpo ('o'), comida ('*'), pared
+// ('#') y celda vacia ('.').
+// ============================================================================
+dibujar_tablero:
+	addi $sp, $sp, -20
+	sw $s0, 0($sp)
+	sw $s1, 4($sp)
+	sw $s2, 8($sp)
+	sw $s3, 12($sp)
+	sw $ra, 16($sp)
+
+	orh $a0, $zero, .hi16 ansi_clear
+	ori $a0, $a0,   .lo16 ansi_clear
+	jal imprimir_asciiz
+
+	addi $t5, $zero, -0x100  // direccion de consola
+
+	// Fila superior de pared: BOARD_W + 2 caracteres '#'
+	lw $t0, BOARD_W($zero)
+	addi $t0, $t0, 2
+	addi $t1, $zero, '#'
+dibujar_tablero'pared_sup:
+	beq $t0, $zero, dibujar_tablero'pared_sup_fin
+	sb $t1, 0($t5)
+	addi $t0, $t0, -1
+	j dibujar_tablero'pared_sup
+dibujar_tablero'pared_sup_fin:
+	jal imprimir_crlf
+
+	addi $s0, $zero, 0  // fila actual (y)
+	lw $s3, BOARD_H($zero)
+dibujar_tablero'fila:
+	bge $s0, $s3, dibujar_tablero'pared_inf
+
+	addi $t1, $zero, '#'
+	sb $t1, 0($t5)
+
+	addi $s1, $zero, 0  // columna actual (x)
+	lw $s2, BOARD_W($zero)
+dibujar_tablero'columna:
+	bge $s1, $s2, dibujar_tablero'fin_columna
+
+	addi $a0, $s1, 0
+	addi $a1, $s0, 0
+	jal celda_char
+	// $a0 = caracter a imprimir
+	sb $a0, 0($t5)
+
+	addi $s1, $s1, 1
+	j dibujar_tablero'columna
+
+dibujar_tablero'fin_columna:
+	addi $t1, $zero, '#'
+	sb $t1, 0($t5)
+	jal imprimir_crlf
+
+	addi $s0, $s0, 1
+	j dibujar_tablero'fila
+
+dibujar_tablero'pared_inf:
+	lw $t0, BOARD_W($zero)
+	addi $t0, $t0, 2
+	addi $t1, $zero, '#'
+dibujar_tablero'pared_inf_loop:
+	beq $t0, $zero, dibujar_tablero'pared_inf_fin
+	sb $t1, 0($t5)
+	addi $t0, $t0, -1
+	j dibujar_tablero'pared_inf_loop
+dibujar_tablero'pared_inf_fin:
+	jal imprimir_crlf
+
+	orh $a0, $zero, .hi16 msg_score
+	ori $a0, $a0,   .lo16 msg_score
+	jal imprimir_asciiz
+
+	lw $a0, score($zero)
+	jal print32u
+	jal imprimir_crlf
+
+	lw $s0, 0($sp)
+	lw $s1, 4($sp)
+	lw $s2, 8($sp)
+	lw $s3, 12($sp)
+	lw $ra, 16($sp)
+	addi $sp, $sp, 20
+	jr $ra, 0
+
+// ============================================================================
+// celda_char: recibe columna en $a0, fila en $a1. Devuelve en $a0 el
+// caracter que corresponde dibujar en esa celda del tablero.
+// ============================================================================
+celda_char:
+	addi $sp, $sp, -20
+	sw $s0, 0($sp)
+	sw $s1, 4($sp)
+	sw $s2, 8($sp)
+	sw $s3, 12($sp)
+	sw $ra, 16($sp)
+
+	addi $s0, $a0, 0  // columna
+	addi $s1, $a1, 0  // fila
+
+	// Comida?
+	lw $t0, food_x($zero)
+	lw $t1, food_y($zero)
+	bne $s0, $t0, celda_char'no_comida
+	bne $s1, $t1, celda_char'no_comida
+	addi $a0, $zero, '*'
+	j celda_char'salir
+celda_char'no_comida:
+
+	// Cabeza?
+	lw $t2, head($zero)
+	lbu $t0, snake_x($t2)
+	lbu $t1, snake_y($t2)
+	bne $s0, $t0, celda_char'no_cabeza
+	bne $s1, $t1, celda_char'no_cabeza
+	addi $a0, $zero, 'O'
+	j celda_char'salir
+celda_char'no_cabeza:
+
+	// Cuerpo? recorremos [tail, head)
+	lw $s2, tail($zero)
+	lw $s3, len($zero)
+	addi $s3, $s3, -1  // no volvemos a chequear la cabeza
+celda_char'chk_cuerpo:
+	beq $s3, $zero, celda_char'vacio
+	lbu $t0, snake_x($s2)
+	lbu $t1, snake_y($s2)
+	bne $s0, $t0, celda_char'chk_cuerpo_next
+	bne $s1, $t1, celda_char'chk_cuerpo_next
+	addi $a0, $zero, 'o'
+	j celda_char'salir
+celda_char'chk_cuerpo_next:
+	addi $s2, $s2, 1
+	andi $s2, $s2, 0xFF
+	addi $s3, $s3, -1
+	j celda_char'chk_cuerpo
+
+celda_char'vacio:
+	addi $a0, $zero, '.'
+
+celda_char'salir:
+	lw $s0, 0($sp)
+	lw $s1, 4($sp)
+	lw $s2, 8($sp)
+	lw $s3, 12($sp)
+	lw $ra, 16($sp)
+	addi $sp, $sp, 20
+	jr $ra, 0
+
+// ============================================================================
+// delay: espera activa para controlar la velocidad del juego (no hay timer).
+// ============================================================================
+delay:
+	addi $t0, $zero, -1  // 0xFFFFFFFF como contador grande
+	andi $t0, $t0, 0x1FFF
+delay'loop:
+	beq $t0, $zero, delay'salir
+	addi $t0, $t0, -1
+	j delay'loop
+delay'salir:
+	jr $ra, 0
+
+// ============================================================================
+// imprimir_crlf: imprime '\r\n' por la consola.
+// ============================================================================
+imprimir_crlf:
+	addi $t0, $zero, -0x100
+	addi $t1, $zero, '\r'
+	sb $t1, 0($t0)
+	addi $t1, $zero, '\n'
+	sb $t1, 0($t0)
+	jr $ra, 0
+
+// ============================================================================
+// imprimir_asciiz: (identica a la de hola_mundo.rtm) toma en $a0 un puntero
+// a una string terminada en NUL y la imprime por consola.
+// ============================================================================
+imprimir_asciiz:
+	addi $sp, $sp, -12
+	sw $s0, 0($sp)
+	sw $s1, 4($sp)
+	sw $s2, 8($sp)
+
+	addi $s0, $a0, 0
+	addi $s2, $zero, -0x100
+
+imprimir_asciiz'bucle:
+	lbu $s1, 0($s0)
+	beq $s1, $zero, imprimir_asciiz'salir
+	sb $s1, 0($s2)
+	addi $s0, $s0, 1
+	j imprimir_asciiz'bucle
+
+imprimir_asciiz'salir:
+	lw $s0, 0($sp)
+	lw $s1, 4($sp)
+	lw $s2, 8($sp)
+	addi $sp, $sp, 12
+	jr $ra, 0
+
+// ============================================================================
+// print32u: (identica a la de criba.rtm) toma en $a0 una palabra no negativa
+// y la imprime en la consola.
+// ============================================================================
+print32u:
+	addi $sp, $sp, -8
+	sw $s0, 0($sp)
+	sw $s1, 4($sp)
+
+	addi $s0, $a0, 0
+	xor $s1, $s1, $s1
+
+	addi $t0, $zero, 10
+	addi $t2, $zero, -0x100
+
+	bne $a0, $zero, print32u'apilar
+
+	addi $t1, $zero, '0'
+	sb $t1, 0($t2)
+	j print32u'salir
+
+print32u'apilar:
+	beq $s0, $zero, print32u'desapilar
+
+	addi $s1, $s1, 1
+
+	restu $t1, $s0, $t0
+
+	sub $s0, $s0, $t1
+	divu $s0, $s0, $t0
+
+	addi $t1, $t1, '0'
+	addi $sp, $sp, -1
+	sb $t1, 0($sp)
+
+	j print32u'apilar
+
+print32u'desapilar:
+	beq $s1, $zero, print32u'salir
+
+	lbu $t1, 0($sp)
+	sb $t1, 0($t2)
+
+	addi $s1, $s1, -1
+	addi $sp, $sp, 1
+
+	j print32u'desapilar
+
+print32u'salir:
+	lw $s0, 0($sp)
+	lw $s1, 4($sp)
+	addi $sp, $sp, 8
+	jr $ra, 0
